@@ -1,0 +1,21 @@
+# Add to compose.yaml (or the existing-n8n/systemd-n8n deployment).
+# These files must be readable only by UID 10001 in the worker container.
+services:
+  pv-wiki-worker:
+    environment:
+      PV_WIKI_DATASHEET_CACHE_DIR: /var/lib/pv-wiki/datasheets
+      EXA_API_KEYS_FILE: /run/secrets/pv-wiki-exa-keys
+      PV_WIKI_EVIDENCE_HMAC_KEY_FILE: /run/secrets/pv-wiki-evidence-hmac-key
+    volumes:
+      - datasheet_cache:/var/lib/pv-wiki/datasheets
+      - type: bind
+        source: ${EXA_KEYS_PATH:?set EXA_KEYS_PATH in .env}
+        target: /run/secrets/pv-wiki-exa-keys
+        read_only: true
+      - type: bind
+        source: ${EVIDENCE_KEY_PATH:?set EVIDENCE_KEY_PATH in .env}
+        target: /run/secrets/pv-wiki-evidence-hmac-key
+        read_only: true
+
+volumes:
+  datasheet_cache:
