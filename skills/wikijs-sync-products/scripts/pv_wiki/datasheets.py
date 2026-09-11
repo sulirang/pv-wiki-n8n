@@ -38,7 +38,7 @@ from .evidence_receipt import (
     verify_datasheet_receipt,
 )
 
-PARSER_VERSION = "pv-datasheet-parser-2026-09-07.1"
+PARSER_VERSION = "pv-datasheet-parser-2026-09-08.1"
 CACHE_DIR_ENV = "PV_WIKI_DATASHEET_CACHE_DIR"
 CACHE_MAX_BYTES_ENV = "PV_WIKI_DATASHEET_CACHE_MAX_BYTES"
 MAX_PDF_BYTES = 10 * 1024 * 1024
@@ -332,6 +332,7 @@ class DatasheetService:
             "layout_contract": documents.PDF_EXTRACTION_CONTRACT_VERSION,
             "pypdf": package_version("pypdf"), "target_model": target_model,
             "max_pages": MAX_PDF_PAGES, "max_chars": MAX_TEXT_CHARS,
+            "page_text_chars": documents.MAX_PAGE_TEXT_SNAPSHOT_CHARS,
         })).hexdigest()
         name = f"{cache_key}.parse.json"
         if self._path(name).exists():
@@ -357,6 +358,7 @@ class DatasheetService:
             status = "needs_visual" if parsed.extracted_pages == 0 or not rows else "partial" if incomplete else "parsed"
             payload = {
                 "text": parsed.text, "parameter_rows": rows, "page_manifest": manifest,
+                "page_texts": [dict(item) for item in parsed.page_texts],
                 "parser_metadata": {
                     "contract_version": PARSER_VERSION, "page_count": parsed.page_count,
                     "extracted_pages": parsed.extracted_pages, "truncated": parsed.truncated,
@@ -370,6 +372,7 @@ class DatasheetService:
             count = inspected["page_count"]
             payload = {
                 "text": "", "parameter_rows": [],
+                "page_texts": [{"page": page, "plain_text": "", "layout_text": "", "plain_text_truncated": False, "layout_text_truncated": False, "truncated": False, "parse_status": "needs_visual"} for page in range(1, count + 1)],
                 "page_manifest": [{"page": page, "text_chars": 0, "has_parameters": False} for page in range(1, count + 1)],
                 "parser_metadata": {"contract_version": PARSER_VERSION, "page_count": count, "extracted_pages": 0, "truncated": False, "parse_status": "needs_visual"},
             }
@@ -413,6 +416,7 @@ class DatasheetService:
             "page_count": verified["parser_metadata"]["page_count"],
             "parse_status": verified["parser_metadata"]["parse_status"],
             "text": parsed["text"], "content": parsed["text"],
+            "page_texts": parsed["page_texts"],
             "suggested_review_pages": review_pages, "receipt": receipt,
         }
 

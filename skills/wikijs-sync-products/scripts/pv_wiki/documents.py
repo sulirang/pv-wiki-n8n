@@ -30,7 +30,7 @@ from .config import is_shared_source_hostname
 from .render import validate_public_http_url
 
 
-PDF_EXTRACTION_CONTRACT_VERSION = "2026-07-29.2"
+PDF_EXTRACTION_CONTRACT_VERSION = "2026-09-08.1"
 PDF_MAGIC = b"%PDF-"
 PDF_CONTENT_TYPES = frozenset({"application/pdf", "application/x-pdf"})
 PDF_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
@@ -49,6 +49,7 @@ MAX_MODEL_PARAMETER_TARGETS = 16
 MAX_MODEL_PARAMETER_ROWS = 500
 MAX_MODEL_PARAMETER_PAGES = 500
 MAX_MODEL_PARAMETER_PAGE_CHARS = 200_000
+MAX_PAGE_TEXT_SNAPSHOT_CHARS = 1_000_000
 MAX_LAYOUT_TABLE_MISSES = 12
 MAX_LAYOUT_CONTINUATION_MISSES = 3
 MAX_LAYOUT_CONTINUATION_HEADERS = 3
@@ -101,6 +102,7 @@ class PDFText:
     truncated: bool
     parameter_rows: tuple[PDFParameterRow, ...] = ()
     page_manifest: tuple[dict[str, Any], ...] = ()
+    page_texts: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -488,6 +490,22 @@ def _normalized_page_text(value: Any) -> str:
     text = re.sub(r"\r\n?", "\n", text)
     text = "\n".join(line.rstrip() for line in text.splitlines())
     return text.strip()
+
+
+def _compact_page_context(value: str, *, layout: bool = False) -> str:
+    """Remove visual padding only in model context, never in column parsing.
+
+    The layout supplement retains line boundaries and double-space column
+    gaps. It is a readable projection, not a replacement for the original
+    fixed-width layout used by ``extract_model_parameter_rows``.
+    """
+
+    separator = "  " if layout else " "
+    return "\n".join(
+        re.sub(r"[^\S\n]{2,}", separator, line.strip())
+        for line in _normalized_page_text(value).splitlines()
+        if line.strip()
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1499,6 +1517,11 @@ class _PDFPageLayoutText:
     raw_text: str
     derived_tables: tuple[str, ...]
     raw_truncated: bool = False
+    context_text: str | None = None
+
+
+def _page_context_text(page: _PDFPageLayoutText) -> str:
+    return page.raw_text if page.context_text is None else page.context_text
 
 
 def _parameter_audit_blocks_for_page(
@@ -1562,6 +1585,7 @@ def _with_cross_page_parameter_audits(
                 raw_text=page.raw_text,
                 derived_tables=(*page.derived_tables, *audits),
                 raw_truncated=page.raw_truncated,
+                context_text=page.context_text,
             )
         )
     return result
@@ -1669,6 +1693,7 @@ def _page_target_priority(
             return 2
     if any(
         _text_contains_complete_model(page.raw_text, model)
+        or _text_contains_complete_model(_page_context_text(page), model)
         for model in target_models
     ):
         return 1
@@ -1757,11 +1782,11 @@ def _target_first_text_allocations(
 
     if not target_models:
         return _fair_text_allocations(
-            [len(page.raw_text) for page in pages],
+            [len(_page_context_text(page)) for page in pages],
             total=total,
         )
     allocations = [
-        min(1, len(page.raw_text))
+        min(1, len(_page_context_text(page)))
         for page in pages
     ]
     remaining = total - sum(allocations)
@@ -1774,12 +1799,12 @@ def _target_first_text_allocations(
             index
             for index, page_priority in enumerate(priorities)
             if page_priority == priority
-            and allocations[index] < len(pages[index].raw_text)
+            and allocations[index] < len(_page_context_text(pages[index]))
         ]
         if not indexes or remaining <= 0:
             continue
         needs = [
-            len(pages[index].raw_text) - allocations[index]
+            len(_page_context_text(pages[index])) - allocations[index]
             for index in indexes
         ]
         tier_budget = min(remaining, sum(needs))
@@ -1862,15 +1887,35 @@ def _assemble_pdf_page_texts(
             page,
             page_count=page_count,
         )
-        block = f"{prefix}{page.raw_text[:allocation]}{suffix}"
+        context_text = _page_context_text(page)
+        block = f"{prefix}{context_text[:allocation]}{suffix}"
         pieces.append(block)
         truncated = (
             truncated
             or page.raw_truncated
-            or allocation < len(page.raw_text)
+            or allocation < len(context_text)
         )
     text = "\n\n".join(pieces)
     return text, len(included), truncated
+
+
+def _bounded_page_texts(pages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep independently addressable page text with explicit channel limits."""
+
+    lengths = [len(page[field]) for page in pages for field in ("plain_text", "layout_text")]
+    allocations = _fair_text_allocations(lengths, total=MAX_PAGE_TEXT_SNAPSHOT_CHARS)
+    result = []
+    for index, original in enumerate(pages):
+        page = dict(original)
+        for offset, field in enumerate(("plain_text", "layout_text")):
+            limit = allocations[index * 2 + offset]
+            page[f"{field}_truncated"] = page[f"{field}_truncated"] or len(page[field]) > limit
+            page[field] = page[field][:limit]
+        page["truncated"] = page["plain_text_truncated"] or page["layout_text_truncated"]
+        if page["truncated"] and page["parse_status"] == "parsed":
+            page["parse_status"] = "partial"
+        result.append(page)
+    return result
 
 
 def _parse_pdf_in_child(
@@ -1910,21 +1955,45 @@ def _parse_pdf_in_child(
             raise PDFParseError("PDF exceeds the configured page limit")
 
         page_layouts: list[_PDFPageLayoutText] = []
+        page_contexts: list[dict[str, Any]] = []
         for index, page in enumerate(reader.pages, start=1):
+            layout_failed = plain_failed = False
             try:
                 raw_text = page.extract_text(extraction_mode="layout")
             except TypeError:
                 raw_text = page.extract_text()
+            except Exception:
+                raw_text = ""
+                layout_failed = True
+            try:
+                plain_text = _compact_page_context(page.extract_text() or "")
+            except Exception:
+                plain_text = ""
+                plain_failed = True
             page_text = _normalized_page_text(raw_text)
-            if not page_text:
+            compact_layout = _compact_page_context(page_text, layout=True)
+            page_contexts.append({
+                "page": index,
+                "plain_text": plain_text[:MAX_MODEL_PARAMETER_PAGE_CHARS],
+                "layout_text": compact_layout[:MAX_MODEL_PARAMETER_PAGE_CHARS],
+                "plain_text_truncated": len(plain_text) > MAX_MODEL_PARAMETER_PAGE_CHARS,
+                "layout_text_truncated": len(compact_layout) > MAX_MODEL_PARAMETER_PAGE_CHARS,
+                "parse_status": (
+                    "needs_visual" if not plain_text and not page_text else
+                    "partial" if layout_failed or plain_failed else "parsed"
+                ),
+            })
+            if not page_text and not plain_text:
                 continue
-            derived_text = _derived_layout_table_text(page_text)
+            bounded_layout = page_text[:MAX_MODEL_PARAMETER_PAGE_CHARS]
+            derived_text = _derived_layout_table_text(bounded_layout)
             page_layouts.append(
                 _PDFPageLayoutText(
                     page_number=index,
-                    raw_text=page_text[:max_chars],
+                    raw_text=bounded_layout,
                     derived_tables=_derived_layout_blocks(derived_text),
-                    raw_truncated=len(page_text) > max_chars,
+                    raw_truncated=len(page_text) > MAX_MODEL_PARAMETER_PAGE_CHARS,
+                    context_text=(plain_text or compact_layout)[:MAX_MODEL_PARAMETER_PAGE_CHARS],
                 )
             )
         parameter_rows = extract_model_parameter_rows(
@@ -1947,7 +2016,9 @@ def _parse_pdf_in_child(
         if not allow_empty_text and len(text.strip()) < MIN_USABLE_PDF_TEXT_CHARS:
             raise PDFParseError("PDF has no usable embedded text")
         parameter_pages = {row.page for row in parameter_rows}
-        layouts_by_page = {page.page_number: page.raw_text for page in page_layouts}
+        contexts_by_page = {page.page_number: _page_context_text(page) for page in page_layouts}
+        page_texts = _bounded_page_texts(page_contexts)
+        truncated = truncated or any(page["truncated"] for page in page_texts)
         parameter_hint = re.compile(
             r"technical\s+(?:data|specification)|datasheet|electrical\s+characteristics|"
             r"specifications|parameters|技术参数|规格参数|性能参数", re.I,
@@ -1959,12 +2030,13 @@ def _parse_pdf_in_child(
                 "page_count": page_count,
                 "extracted_pages": extracted_pages,
                 "truncated": truncated,
+                "page_texts": page_texts,
                 "page_manifest": [
                     {
                         "page": number,
-                        "text_chars": len(layouts_by_page.get(number, "")),
+                        "text_chars": len(contexts_by_page.get(number, "")),
                         "has_parameters": number in parameter_pages or bool(
-                            parameter_hint.search(layouts_by_page.get(number, ""))
+                            parameter_hint.search(contexts_by_page.get(number, ""))
                         ),
                     }
                     for number in range(1, page_count + 1)
@@ -2096,6 +2168,7 @@ def parse_pdf_text(
             if isinstance(item, Mapping)
         ),
         page_manifest=tuple(dict(item) for item in result.get("page_manifest", ())),
+        page_texts=tuple(dict(item) for item in result.get("page_texts", ())),
     )
 
 

@@ -344,10 +344,32 @@ def _specifications(product: Any, decision: Any) -> list[tuple[str, str, Any]]:
     )
 
 
-def _datasheet_parameters(decision: Any) -> list[dict[str, str]]:
-    """Return display-ready datasheet parameters in their exact source order."""
+def _value_with_unit(value: Any, unit: Any) -> str:
+    """Append a missing display unit without rewriting the stored raw value."""
+    rendered = _plain_text(value)
+    suffix = _plain_text(unit)
+    if not rendered or not suffix:
+        return rendered
+    compact_value = re.sub(r"\s+", "", unicodedata.normalize("NFKC", rendered))
+    compact_unit = re.sub(r"\s+", "", unicodedata.normalize("NFKC", suffix))
+    for match in re.finditer(re.escape(compact_unit), compact_value):
+        before = compact_value[:match.start()]
+        after = compact_value[match.end():]
+        # A complete unit may precede a parenthesized conversion. Neither its
+        # prefix nor suffix can be part of another unit: W != kW or W/m²,
+        # m != mm, N·m, or m/s. SI unit case remains significant.
+        joins_unit = "/·⋅*^_²³"
+        left_bound = not before or not (before[-1].isalpha() or before[-1] in joins_unit)
+        right_bound = not after or not (after[0].isalnum() or after[0] in joins_unit)
+        if left_bound and right_bound:
+            return rendered
+    return f"{rendered} {suffix}"
 
-    parameters: list[dict[str, str]] = []
+
+def _datasheet_parameters(decision: Any) -> list[dict[str, Any]]:
+    """Return display-ready parameters in the accepted candidate's order."""
+
+    parameters: list[dict[str, Any]] = []
     for item in _as_items(_get(decision, "datasheet_parameters")):
         if not isinstance(item, Mapping):
             continue
@@ -362,9 +384,7 @@ def _datasheet_parameters(decision: Any) -> list[dict[str, str]]:
         if name is None or not value_present or value is None:
             continue
         unit = _first(item, ("unit", "units"))
-        rendered_value = _plain_text(value)
-        if rendered_value and unit is not None and _plain_text(unit):
-            rendered_value = f"{rendered_value} {_plain_text(unit)}"
+        rendered_value = _value_with_unit(value, unit)
         parameters.append(
             {
                 "id": f"p{len(parameters) + 1:03d}",
@@ -375,14 +395,75 @@ def _datasheet_parameters(decision: Any) -> list[dict[str, str]]:
                 "name": _plain_text(name),
                 "name_zh": _plain_text(_get(item, "name_zh")),
                 "value": rendered_value,
+                "value_zh": (_value_with_unit(_get(item, "value_zh"), unit)
+                             if _plain_text(_get(item, "value_zh")) else ""),
                 "page": _plain_text(_get(item, "page")),
                 "scope": _plain_text(_get(item, "scope")),
                 "conditions": _plain_text(_get(item, "conditions")),
+                "conditions_zh": _plain_text(_get(item, "conditions_zh")),
                 "footnotes": _plain_text(_get(item, "footnotes")),
+                "footnote_originals": [_plain_text(note) for note in _as_items(_get(item, "footnotes"))],
+                "footnotes_zh": [_plain_text(note) for note in _as_items(_get(item, "footnotes_zh"))],
                 "source_kind": _plain_text(_get(item, "source_kind")),
             }
         )
     return parameters
+
+
+def _group_datasheet_parameters(parameters: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Gather repeated groups stably while keeping parameter IDs and raw order within each group."""
+    sections: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    section_labels: dict[str, tuple[str, str]] = {}
+    subsection_labels: dict[tuple[str, str], tuple[str, str]] = {}
+    for original in parameters:
+        row = dict(original)
+        section = row["section"] or row["section_zh"]
+        subsection = row["subsection"] or row["subsection_zh"]
+        sections.setdefault(section, {}).setdefault(subsection, []).append(row)
+        old = section_labels.get(section, ("", ""))
+        section_labels[section] = (old[0] or row["section"], old[1] or row["section_zh"])
+        old = subsection_labels.get((section, subsection), ("", ""))
+        subsection_labels[(section, subsection)] = (old[0] or row["subsection"], old[1] or row["subsection_zh"])
+    grouped = []
+    for section, subsections in sections.items():
+        for subsection, rows in subsections.items():
+            for row in rows:
+                row["section"], row["section_zh"] = section_labels[section]
+                row["subsection"], row["subsection_zh"] = subsection_labels[(section, subsection)]
+                grouped.append(row)
+    return grouped
+
+
+def _datasheet_value_cell(parameter: Mapping[str, Any]) -> str:
+    """Show translated descriptions first, retaining the exact source value."""
+    original = parameter["value"]
+    translated = parameter["value_zh"]
+    if translated and translated != original:
+        return f"{escape_table_cell(translated)}<br><br>原文：{escape_table_cell(original)}"
+    return escape_table_cell(original)
+
+
+def _datasheet_notes_cell(parameter: Mapping[str, Any]) -> str:
+    """Keep each source condition/footnote beside its own Chinese paragraph."""
+    paragraphs = []
+
+    def append_note(label: str, original: str, translated: str) -> None:
+        if not original:
+            return
+        paragraphs.append(f"{label}（原文）：{escape_table_cell(original)}")
+        if translated:
+            paragraphs.append(f"{label}（中文）：{escape_table_cell(translated)}")
+
+    append_note("条件", parameter["conditions"], parameter["conditions_zh"])
+    translations = parameter["footnotes_zh"]
+    originals = parameter["footnote_originals"]
+    for index, original in enumerate(originals):
+        translated = translations[index] if index < len(translations) else ""
+        label = f"脚注 {index + 1}" if len(originals) > 1 else "脚注"
+        append_note(label, original, translated)
+    if parameter["scope"] == "shared":
+        paragraphs.append("明确适用本型号的系列共用参数")
+    return "<br><br>".join(paragraphs) or "—"
 
 
 def _derived_insights(decision: Any) -> list[dict[str, Any]]:
@@ -671,6 +752,10 @@ def product_description_zh(product: Any, decision: Any) -> str:
     )
     if localized is None:
         return ""
+    if str(_get(decision, "schema_version", "")) == "4":
+        # The v4 introduction is complete prose, not a legacy display-title
+        # prefix. Stripping a company such as "Co., Ltd." can leave a fragment.
+        return _plain_text(localized)
     return _without_leading_identity(
         localized,
         (
@@ -850,7 +935,10 @@ def _product_rows(product: Any, decision: Any) -> list[tuple[str, Any]]:
                 ),
             )
         elif label == "产品描述":
-            value = product_bilingual_description(product, decision)
+            value = (product_description_zh(product, decision)
+                     or _first(product, ("product_name", "name", "description"))
+                     if str(_get(decision, "schema_version", "")) == "4"
+                     else product_bilingual_description(product, decision))
         if value is not None:
             rows.append((label, value))
     return rows
@@ -1128,6 +1216,9 @@ def render_product_page(
     datasheet_v4 = str(_get(decision, "schema_version", "")) == "4"
     title = product_page_title(product)
     subtitle = product_bilingual_description(product, decision)
+    category = _plain_text(_first(decision, ("product_category", "category", "product_type", "type")))
+    if datasheet_v4 and category.casefold() in {"", "other", "unknown", "其他", "未知", "待分类"}:
+        subtitle = _plain_text(_first(product, ("product_name", "name", "description"))) or product_display_title(product, decision)
 
     lines = [
         AUTO_BEGIN,
@@ -1163,13 +1254,16 @@ def render_product_page(
         )
 
     datasheet_parameters = _datasheet_parameters(decision)
+    if datasheet_v4:
+        datasheet_parameters = _group_datasheet_parameters(datasheet_parameters)
     specifications = _specifications(product, decision)
     derived_insights = _derived_insights(decision)
     lines.extend(["", "## 产品参数", ""])
     if datasheet_parameters:
         lines.append(
             f"**参数完整性：** 已安全提取 {len(datasheet_parameters)} 项数据表参数，"
-            "按原数据表顺序和层级展示；此数量不代表数据表的全部字段。"
+            + ("按数据表参数分组展示；此数量不代表数据表的全部字段。" if datasheet_v4
+               else "按原数据表顺序和层级展示；此数量不代表数据表的全部字段。")
         )
         lines.extend(
             [
@@ -1221,14 +1315,10 @@ def render_product_page(
             parameter_line = (
                 f"| {escape_table_cell(parameter['name'])} | "
                 f"{escape_table_cell(parameter['name_zh'] or '—')} | "
-                f"{escape_table_cell(parameter['value'])} |"
+                f"{_datasheet_value_cell(parameter) if datasheet_v4 else escape_table_cell(parameter['value'])} |"
             )
             if datasheet_v4:
-                notes = "；".join(text for text in (
-                    parameter["conditions"], parameter["footnotes"],
-                    "明确适用本型号的系列共用参数" if parameter["scope"] == "shared" else "",
-                ) if text)
-                parameter_line += (f" {escape_table_cell(notes or '—')} | "
+                parameter_line += (f" {_datasheet_notes_cell(parameter)} | "
                                    f"{escape_table_cell(parameter['page'])} |")
             lines.append(parameter_line)
             previous_section = section
@@ -1286,7 +1376,8 @@ def render_product_page(
             for item in derived_insights
         )
 
-    lines.extend(_professional_analysis_lines(decision, datasheet_parameters))
+    if not datasheet_v4:
+        lines.extend(_professional_analysis_lines(decision, datasheet_parameters))
 
     if datasheet_v4:
         lines.extend(["", "## 解析与校对说明", ""])
@@ -1310,10 +1401,10 @@ def render_product_page(
                 lines.append(f"- {_escape_markdown_text(omission)}")
         if not omissions:
             lines.append("未单独列出缺失项；请结合原始数据表确认未展示的字段。")
-        if _get(decision, "analysis_status") == "unavailable":
-            lines.append("专业分析或翻译未完成，已确认参数照常展示。")
-        if _get(decision, "analysis_omissions"):
-            lines.append("部分翻译或分析段落未通过校验，已省略；原始参数保持完整。")
+        if _get(decision, "translation_status", _get(decision, "analysis_status")) == "unavailable":
+            lines.append("中文翻译未完成，已确认参数照常展示。")
+        if _get(decision, "translation_omissions"):
+            lines.append("部分中文翻译未通过校验，已省略；原始参数保持完整。")
         for parameter in _as_items(_get(decision, "datasheet_parameters")):
             correction = _get(parameter, "correction")
             if isinstance(correction, Mapping):
@@ -1322,10 +1413,8 @@ def render_product_page(
                 lines.append(
                     f"- 图片校正：{_escape_markdown_text(_get(parameter, 'name'))}"
                     f"（第 {_escape_markdown_text(_get(parameter, 'page'))} 页），"
-                    f"{_escape_markdown_text(_get(before, 'value', '未提取'))} "
-                    f"{_escape_markdown_text(_get(before, 'unit'))} → "
-                    f"{_escape_markdown_text(_get(after, 'value'))} "
-                    f"{_escape_markdown_text(_get(after, 'unit'))}；"
+                    f"{_escape_markdown_text(_value_with_unit(_get(before, 'value', '未提取'), _get(before, 'unit')))} → "
+                    f"{_escape_markdown_text(_value_with_unit(_get(after, 'value'), _get(after, 'unit')))}；"
                     f"{_escape_markdown_text(_get(correction, 'reason'))}"
                 )
 

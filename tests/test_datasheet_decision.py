@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "skills" / "wikijs-
 
 from pv_wiki.catalogue_snapshot import replace_catalogue_snapshot
 from pv_wiki.config import WikiSettings
+from pv_wiki.datasheet_decision import normalize_optional_analysis, validate_datasheet_decision
 from pv_wiki.evidence_receipt import issue_datasheet_receipt, issue_datasheet_view_receipt
 from pv_wiki.hermes_store import (
     CompletionValidationError, HermesCompletionStore, PublicationFenceError,
@@ -35,24 +36,28 @@ def product(product_id: str = "P-42", brand: str | None = "Unknown Maker") -> di
 
 
 def evidence(*, model: str = "PV-42", content: str = TEXT, official_page: str | None = None,
-             link_verified: bool = True, parameter_pages: tuple[int, ...] = ()) -> dict:
+             link_verified: bool = True, parameter_pages: tuple[int, ...] = (),
+             pdf_url: str = PDF_URL, requested_pdf: str | None = None) -> dict:
+    requested_pdf = requested_pdf or pdf_url
     page_evidence = None
     if official_page:
         page_evidence = {"requested_url": official_page, "final_url": official_page,
                          "redirect_chain": [official_page], "content_sha256": "b" * 64,
                          "link_status": "verified" if link_verified else "unverified",
-                         "matched_link": PDF_URL if link_verified else None,
+                         "matched_link": pdf_url if link_verified else None,
                          "excerpt": "Manufacturer product downloads"}
     receipt = issue_datasheet_receipt(
         KEY, content=content, document_id=DOC, artifact_sha256=DOC,
-        requested_url=PDF_URL, url=PDF_URL, official_page_url=official_page,
-        official_page_evidence=page_evidence, redirect_chain=[PDF_URL], target_model=model,
+        requested_url=requested_pdf, url=pdf_url, official_page_url=official_page,
+        official_page_evidence=page_evidence,
+        redirect_chain=[requested_pdf, pdf_url] if requested_pdf != pdf_url else [pdf_url],
+        target_model=model,
         parameter_rows=[], parser_metadata={"contract_version": "test-datasheet-v1", "page_count": 3,
         "extracted_pages": 3 if content else 0, "truncated": False,
         "parse_status": "parsed" if content else "needs_visual"},
         page_manifest=[{"page": page, "text_chars": len(content), "has_parameters": page in parameter_pages} for page in (1, 2, 3)],
     )
-    return {"url": PDF_URL, "content": content, "receipt": receipt}
+    return {"url": pdf_url, "content": content, "receipt": receipt}
 
 
 def view_receipt(page: int = 2, document_id: str = DOC) -> dict:
@@ -135,7 +140,96 @@ class DatasheetDecisionTests(unittest.TestCase):
             rendered = RenderModel.from_completion(saved).decision
             self.assertEqual("末项参数", rendered["datasheet_parameters"][-1]["name_zh"])
             self.assertNotIn("name_zh", rendered["datasheet_parameters"][0])
-            self.assertEqual(1, len(rendered["professional_analysis"]["sections"][0]["paragraphs"]))
+            self.assertNotIn("professional_analysis", rendered)
+            self.assertEqual(1, len(saved.decision["analysis"]["sections"][0]["paragraphs"]))
+            self.assertEqual("partial", rendered["translation_status"])
+            self.assertEqual(1, len(rendered["translation_omissions"]))
+
+    def test_bilingual_values_and_notes_roundtrip_without_changing_source_or_hash(self) -> None:
+        payload = decision(value="Ja")
+        first = payload["parameters"][0]
+        first.update({"source_label": "Bescherming tegen eilandbedrijf", "unit": "",
+                      "footnotes": ["Bij nominale netspanning", "Waarden bij 25 °C"]})
+        payload["parameters"].append({**copy.deepcopy(first), "parameter_id": "p002",
+            "source_label": "Instelbare vermogensfactor", "value": "0.8 geleidend ... 0.8 na-ijlend"})
+        original = copy.deepcopy(payload)
+        baseline, _ = validate_datasheet_decision(original, product_id="P-42", product=product(),
+                                                 evidence_documents=[evidence()], evidence_hmac_key=KEY)
+        payload["analysis"] = {"translations": [
+            {"parameter_id": "p001", "name_zh": "防孤岛保护", "value_zh": "支持",
+             "conditions_zh": "在标称电网电压下", "footnotes_zh": ["在标称电网电压下", "数值对应 25 °C 条件。"]},
+            {"parameter_id": "p002", "value_zh": "0.8 超前～0.8 滞后"},
+        ]}
+        with self.store() as store:
+            saved = self.save(store, payload).completion
+            self.assertTrue(saved.publishable)
+            self.assertEqual(baseline["parameters"], saved.decision["parameters"])
+            self.assertEqual(baseline["parameter_set_sha256"], saved.decision["parameter_set_sha256"])
+            self.assertEqual(payload["analysis"]["translations"], store.get_completion("P-42").decision["analysis"]["translations"])
+            rendered = RenderModel.from_completion(saved).decision
+            rows = rendered["datasheet_parameters"]
+            self.assertEqual("Ja", rows[0]["value"])
+            self.assertEqual("支持", rows[0]["value_zh"])
+            self.assertEqual("在标称电网电压下", rows[0]["conditions_zh"])
+            self.assertEqual(["在标称电网电压下", "数值对应 25 °C 条件。"], rows[0]["footnotes_zh"])
+            self.assertEqual("0.8 geleidend ... 0.8 na-ijlend", rows[1]["value"])
+            self.assertEqual("0.8 超前～0.8 滞后", rows[1]["value_zh"])
+            rows[0]["footnotes"][0] = "display mutation"
+            self.assertEqual("Bij nominale netspanning", saved.decision["parameters"][0]["footnotes"][0])
+            self.assertEqual(original["parameters"], payload["parameters"])
+
+    def test_invalid_optional_translation_fields_leave_valid_siblings_and_note_positions(self) -> None:
+        payload = decision()
+        payload["parameters"][0]["footnotes"] = ["First source note", "Second source note", "Third source note"]
+        payload["analysis"] = {"translations": [{"parameter_id": "p001", "name_zh": 42,
+            "section_zh": "交流输出", "value_zh": ["invalid"], "conditions_zh": "在标称电网电压下",
+            "footnotes_zh": ["第一条脚注", 17, "第三条脚注"]}]}
+        with self.store() as store:
+            saved = self.save(store, payload).completion
+            self.assertTrue(saved.publishable)
+            self.assertEqual("partial", saved.decision["analysis_status"])
+            translated = saved.decision["analysis"]["translations"][0]
+            self.assertNotIn("name_zh", translated)
+            self.assertNotIn("value_zh", translated)
+            self.assertEqual("交流输出", translated["section_zh"])
+            self.assertEqual("在标称电网电压下", translated["conditions_zh"])
+            self.assertEqual(["第一条脚注", "", "第三条脚注"], translated["footnotes_zh"])
+            self.assertEqual({"translations[0].name_zh", "translations[0].value_zh",
+                              "translations[0].footnotes_zh[1]"},
+                             {item["item"] for item in saved.decision["analysis_omissions"]})
+            self.assertEqual(payload["parameters"][0]["footnotes"], saved.decision["parameters"][0]["footnotes"])
+
+    def test_footnote_translation_alignment_handles_legacy_string_and_empty_placeholders(self) -> None:
+        for source, translated in (("Legacy source note", ["历史脚注"]),
+                                   ("", []), (["First", "", "Third"], ["第一条", "", "第三条"])):
+            with self.subTest(source=source):
+                rows = [{"parameter_id": "p001", "footnotes": source}]
+                result, rejected = normalize_optional_analysis({"translations": [
+                    {"parameter_id": "p001", "name_zh": "参数", "footnotes_zh": translated}]}, rows)
+                self.assertEqual([], rejected)
+                self.assertEqual(translated, result["translations"][0]["footnotes_zh"])
+        result, rejected = normalize_optional_analysis({"translations": [
+            {"parameter_id": "p001", "name_zh": "参数", "value_zh": "支持", "footnotes_zh": ["无法匹配"]}]},
+            [{"parameter_id": "p001", "footnotes": ["First", "Second"]}])
+        self.assertEqual("支持", result["translations"][0]["value_zh"])
+        self.assertNotIn("footnotes_zh", result["translations"][0])
+        self.assertEqual("translations[0].footnotes_zh", rejected[0]["item"])
+
+    def test_datasheet_language_metadata_is_optional_and_cannot_block_confirmed_parameters(self) -> None:
+        payload = decision()
+        payload["official_source"].update({"datasheet_language": "nl",
+            "language_selection_reason": "No official English edition for this exact model and market was found."})
+        with self.store() as store:
+            saved = self.save(store, payload).completion
+            self.assertEqual("nl", saved.decision["official_source"]["datasheet_language"])
+            self.assertEqual(payload["official_source"]["language_selection_reason"],
+                             saved.decision["official_source"]["language_selection_reason"])
+        payload["official_source"]["datasheet_language"] = ["invalid"]
+        normalized, _ = validate_datasheet_decision(payload, product_id="P-42", product=product(),
+                                                   evidence_documents=[evidence()], evidence_hmac_key=KEY)
+        self.assertNotIn("datasheet_language", normalized["official_source"])
+        self.assertEqual("official_source.datasheet_language", normalized["omissions"][-1]["source_label"])
+        self.assertEqual(1, len(normalized["parameters"]))
 
     def test_missing_official_identity_reason_keeps_product_unfinished(self) -> None:
         payload = decision()
@@ -144,6 +238,31 @@ class DatasheetDecisionTests(unittest.TestCase):
             with self.assertRaisesRegex(CompletionValidationError, "verification_reason"):
                 self.save(store, payload)
             self.assertIsNotNone(store.next_product())
+
+    def test_brand_prefixed_spaced_catalogue_model_saves_only_the_exact_model(self) -> None:
+        record = product("01073873", "HUAWEI")
+        record["product_name"] = "HUAWEI SUN2000L - 3.68KTL"
+        with StateStore(self.path) as state:
+            replace_catalogue_snapshot(state, [record])
+        for model in (
+            "SUN2000L", "3.68KTL", "SUN2000-3.68KTL", "SUN2000L1-3.68KTL",
+            "SUN2000L-3.6KTL", "SUN2000L-3.68KTL-L1", "SUN2000L-3.68KTL-M1",
+            "SUN2000L-3.68KTL",
+        ):
+            payload = decision(product_id=record["product_id"])
+            payload.update({"manufacturer": "Huawei", "model": model})
+            payload["parameters"][0]["model"] = model
+            with self.subTest(model=model), self.store() as store:
+                if model == "SUN2000L-3.68KTL":
+                    saved = self.save(store, payload, [evidence(model=model)]).completion
+                    self.assertTrue(saved.publishable)
+                    self.assertEqual(model, saved.decision["model"])
+                    self.assertEqual(model, saved.decision["parameters"][0]["model"])
+                else:
+                    with self.assertRaisesRegex(CompletionValidationError,
+                                                "model does not match the catalogue"):
+                        self.save(store, payload, [evidence(model=model)])
+                    self.assertEqual(0, store.counts()["completed"])
 
     def test_missing_known_parameter_page_is_partial_review_without_blocking_publication(self) -> None:
         payload = decision()
@@ -233,6 +352,78 @@ class DatasheetDecisionTests(unittest.TestCase):
                     self.save(store, documents=documents)
         with self.store() as store:
             self.assertTrue(self.save(store, documents=[evidence(official_page="https://brand.example/product")]).created)
+
+    def test_direct_brand_official_pdf_preserves_unverified_support_page(self) -> None:
+        pdf_url = "https://solar.huawei.com/download?document=datasheet"
+        official_page = "https://support.huawei.com/product"
+        with StateStore(self.path) as state:
+            replace_catalogue_snapshot(state, [product(brand="HUAWEI")])
+        payload = decision()
+        payload["manufacturer"] = "Huawei Technologies Co., Ltd."
+        payload["official_source"].update({"url": pdf_url, "official_page_url": official_page})
+        document = evidence(pdf_url=pdf_url, official_page=official_page, link_verified=False)
+        with self.store() as store:
+            saved = self.save(store, payload, [document]).completion
+            self.assertTrue(saved.publishable)
+            source = saved.decision["official_source"]
+            self.assertEqual(pdf_url, source["url"])
+            self.assertEqual(official_page, source["official_page_url"])
+            self.assertEqual("unverified", source["official_page_evidence"]["link_status"])
+            self.assertIsNone(source["official_page_evidence"]["matched_link"])
+
+    def test_direct_official_pdf_exception_uses_catalogue_brand_and_final_exact_host(self) -> None:
+        for brand, pdf_url, requested_pdf in (
+            ("HUAWEI", "https://unknown-cdn.example/datasheet.pdf", None),
+            ("HUAWEI", "https://solar.huawei.com.attacker.example/datasheet.pdf", None),
+            ("HUAWEI", "https://unconfigured.solar.huawei.com/datasheet.pdf", None),
+            ("HUAWEI", "https://aikosolar.com/datasheet.pdf", None),
+            ("AIKO", "https://solar.huawei.com/datasheet.pdf", None),
+            ("UNKNOWN-BRAND", "https://solar.huawei.com/datasheet.pdf", None),
+            ("HUAWEI", "https://unknown-cdn.example/datasheet.pdf",
+             "https://solar.huawei.com/download"),
+        ):
+            with self.subTest(brand=brand, pdf_url=pdf_url, requested_pdf=requested_pdf):
+                with StateStore(self.path) as state:
+                    replace_catalogue_snapshot(state, [product(brand=brand)])
+                payload = decision()
+                # The proposal cannot choose the trusted brand for itself.
+                payload["manufacturer"] = "Huawei"
+                payload["official_source"]["url"] = pdf_url
+                document = evidence(pdf_url=pdf_url, requested_pdf=requested_pdf,
+                                    official_page="https://support.huawei.com/product",
+                                    link_verified=False)
+                with self.store() as store:
+                    with self.assertRaisesRegex(CompletionValidationError,
+                                                "verified official-page download link"):
+                        self.save(store, payload, [document])
+                    self.assertEqual(0, store.counts()["completed"])
+
+    def test_verified_official_page_link_still_allows_an_external_cdn(self) -> None:
+        pdf_url = "https://unknown-cdn.example/datasheet.pdf"
+        with StateStore(self.path) as state:
+            replace_catalogue_snapshot(state, [product(brand="HUAWEI")])
+        payload = decision()
+        payload["official_source"]["url"] = pdf_url
+        document = evidence(pdf_url=pdf_url, official_page="https://solar.huawei.com/product",
+                            link_verified=True)
+        with self.store() as store:
+            source = self.save(store, payload, [document]).completion.decision["official_source"]
+            self.assertEqual("verified", source["official_page_evidence"]["link_status"])
+            self.assertEqual(pdf_url, source["official_page_evidence"]["matched_link"])
+
+    def test_direct_brand_official_pdf_still_requires_valid_signed_evidence(self) -> None:
+        pdf_url = "https://solar.huawei.com/datasheet.pdf"
+        with StateStore(self.path) as state:
+            replace_catalogue_snapshot(state, [product(brand="HUAWEI")])
+        payload = decision()
+        payload["official_source"]["url"] = pdf_url
+        document = evidence(pdf_url=pdf_url, official_page="https://support.huawei.com/product",
+                            link_verified=False)
+        document["receipt"]["signature"] = "tampered"
+        with self.store() as store:
+            with self.assertRaises(CompletionValidationError):
+                self.save(store, payload, [document])
+            self.assertEqual(0, store.counts()["completed"])
 
     def test_reresearch_backs_up_once_then_replaces_with_revision_and_old_path(self) -> None:
         backup = self.folder / "before.json"

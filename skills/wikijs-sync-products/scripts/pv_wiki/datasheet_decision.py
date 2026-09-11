@@ -16,11 +16,11 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from . import evidence_receipt as receipts
+from .config import trusted_source_domains_for_product
 from .decision import model_matches_catalogue_identity
 from .parameter_analysis import (
     ANALYSIS_SECTION_TITLES,
     apply_parameter_translations,
-    professional_analysis,
     validate_parameter_enrichment,
 )
 from .render import validate_public_http_url
@@ -248,6 +248,7 @@ def analysis_input(parameters: Sequence[Mapping[str, Any]]) -> list[dict[str, An
 
 def normalize_optional_analysis(
     raw: Any, parameters: Sequence[Mapping[str, Any]],
+    *, include_product_analysis: bool = True,
 ) -> tuple[dict[str, Any] | None, list[dict[str, str]]]:
     """Accept partial model translations and analysis without numeric gates.
 
@@ -257,7 +258,8 @@ def normalize_optional_analysis(
     if raw is None:
         return None, []
     rejected: list[dict[str, str]] = []
-    allowed_ids = {row["parameter_id"] for row in parameters}
+    parameters_by_id = {row["parameter_id"]: row for row in parameters}
+    allowed_ids = set(parameters_by_id)
     def reject(path: str, exc: BaseException) -> None:
         rejected.append({"item": path, "reason": str(exc)[:300]})
     try:
@@ -278,14 +280,48 @@ def normalize_optional_analysis(
             parameter_id = item.get("parameter_id")
             if not isinstance(parameter_id, str) or parameter_id not in allowed_ids or parameter_id in translated:
                 raise DatasheetDecisionError("translation must name one known, nonduplicate parameter ID")
-            normalized = {"parameter_id": parameter_id,
-                          "name_zh": _text(item.get("name_zh"), f"{path}.name_zh", required=True, maximum=500),
-                          "section_zh": _text(item.get("section_zh"), f"{path}.section_zh", maximum=300),
-                          "subsection_zh": _text(item.get("subsection_zh"), f"{path}.subsection_zh", maximum=300)}
-            result["translations"].append(normalized)
-            translated.add(parameter_id)
         except DatasheetDecisionError as exc:
             reject(path, exc)
+            continue
+        normalized: dict[str, Any] = {"parameter_id": parameter_id}
+        # Display wording is separate from the immutable source parameters. A
+        # malformed optional field must not remove its sibling translations.
+        for field, maximum in (("name_zh", 500), ("section_zh", 300),
+                               ("subsection_zh", 300), ("value_zh", 4000),
+                               ("conditions_zh", 4000)):
+            if field not in item:
+                continue
+            try:
+                text = _text(item[field], f"{path}.{field}", maximum=maximum)
+                if text:
+                    normalized[field] = text
+            except DatasheetDecisionError as exc:
+                reject(f"{path}.{field}", exc)
+        if "footnotes_zh" in item:
+            notes_path = f"{path}.footnotes_zh"
+            source_notes = parameters_by_id[parameter_id].get("footnotes", [])
+            if isinstance(source_notes, str):
+                source_notes = [source_notes] if source_notes.strip() else []
+            try:
+                notes = _array(item["footnotes_zh"], notes_path, maximum=100)
+                if len(notes) != len(source_notes):
+                    raise DatasheetDecisionError(f"{notes_path} must match source footnote positions")
+            except DatasheetDecisionError as exc:
+                reject(notes_path, exc)
+            else:
+                translated_notes: list[str] = []
+                for number, note in enumerate(notes):
+                    try:
+                        translated_notes.append(_text(note, f"{notes_path}[{number}]", maximum=4000))
+                    except DatasheetDecisionError as exc:
+                        translated_notes.append("")
+                        reject(f"{notes_path}[{number}]", exc)
+                normalized["footnotes_zh"] = translated_notes
+        if len(normalized) > 1:
+            result["translations"].append(normalized)
+        translated.add(parameter_id)
+    if not include_product_analysis:
+        return result if result["translations"] else None, rejected
     try:
         sections = _array(raw.get("sections", []), "analysis.sections", maximum=30)
     except DatasheetDecisionError as exc:
@@ -371,7 +407,15 @@ def validate_datasheet_decision(
         pdf_host = urlsplit(source_url).hostname
         if page_host != pdf_host:
             link_evidence = document.get("official_page_evidence") or {}
-            if link_evidence.get("link_status") != "verified":
+            # A signed PDF served directly by a configured manufacturer host
+            # does not need a second official page to link to it. Resolve only
+            # from the catalogue brand, never the model's manufacturer claim,
+            # and compare the final PDF host exactly (not a redirect origin).
+            official_hosts = trusted_source_domains_for_product(
+                product.get("brand_code"), None,
+            )
+            if (pdf_host not in official_hosts
+                    and link_evidence.get("link_status") != "verified"):
                 raise DatasheetDecisionError("cross-host PDF requires a verified official-page download link")
     visual = _visual_review(decision.get("visual_review"), document_id,
                             document["parser_metadata"]["page_count"], evidence_hmac_key)
@@ -396,6 +440,15 @@ def validate_datasheet_decision(
     for field in ("product_category_code", "product_category", "product_type", "product_description_zh",
                   "manufacturer_zh", "summary", "decision_notes"):
         normalized[field] = _text(decision.get(field), field, maximum=1000)
+    for field, maximum in (("datasheet_language", 80), ("language_selection_reason", 1000)):
+        if field in source:
+            try:
+                language_metadata = _text(source[field], f"official_source.{field}", maximum=maximum)
+                if language_metadata:
+                    normalized["official_source"][field] = language_metadata
+            except DatasheetDecisionError as exc:
+                normalized["omissions"].append({"source_label": f"official_source.{field}",
+                                               "reason": str(exc)[:300]})
     enrichment = decision.get("parameter_enrichment")
     if enrichment is not None:
         try:
@@ -420,32 +473,45 @@ def validate_datasheet_decision(
 def render_datasheet_decision(decision: Mapping[str, Any]) -> dict[str, Any]:
     rendered = dict(decision)
     rendered["_render_schema"] = 4
+    # Product comparisons belong to a later, separate workflow. Keep historical
+    # analysis in storage, but render only its parameter translations here.
+    rendered.pop("professional_analysis", None)
+    if "\ufffd" in str(rendered.get("product_description_zh", "")):
+        rendered["product_description_zh"] = " ".join(
+            str(decision.get(field) or "").strip() for field in ("manufacturer", "model")
+            if decision.get(field)
+        )
     parameters = analysis_input(decision.get("parameters", []))
     displayed = [dict(row) for row in parameters]
+    translated = False
+    translation_omissions = [copy.deepcopy(item) for item in (decision.get("analysis_omissions") or [])
+                            if isinstance(item, Mapping)
+                            and (str(item.get("item", "")).startswith("translations")
+                                 or item.get("item") == "analysis")]
     enrichment = decision.get("parameter_enrichment")
     if enrichment is not None:
         try:
             displayed = apply_parameter_translations(parameters, enrichment)
-            rendered["professional_analysis"] = professional_analysis(enrichment, parameters)
-        except (ValueError, TypeError, KeyError):
-            rendered["analysis_status"] = "unavailable"
-            rendered.pop("professional_analysis", None)
-    optional, rejected = normalize_optional_analysis(decision.get("analysis"), decision.get("parameters", []))
+            translated = any(row.get("name_zh") for row in displayed)
+        except (ValueError, TypeError, KeyError) as exc:
+            translation_omissions.append({"item": "parameter_enrichment.translations", "reason": str(exc)[:300]})
+    optional, rejected = normalize_optional_analysis(
+        decision.get("analysis"), decision.get("parameters", []), include_product_analysis=False,
+    )
+    translation_omissions.extend(item for item in rejected if item not in translation_omissions)
     if optional is not None:
         by_id = {item["parameter_id"]: item for item in optional["translations"]}
         for row in displayed:
             translation = by_id.get(row["parameter_id"])
             if translation:
                 row.update({key: value for key, value in translation.items() if key != "parameter_id"})
-        if optional["sections"] or optional["overall_limitations_zh"]:
-            rendered["professional_analysis"] = {
-                "sections": optional["sections"],
-                "overall_limitations_zh": optional["overall_limitations_zh"],
-            }
+        translated = translated or bool(by_id)
     for display, original in zip(displayed, decision.get("parameters", [])):
         for field in ("model", "scope", "applies_to_models", "page", "source_url", "document_sha256",
                       "table_title", "column_header", "correction", "conditions", "footnotes", "source_kind"):
             if field in original:
-                display[field] = original[field]
+                display[field] = copy.deepcopy(original[field])
     rendered["datasheet_parameters"] = displayed
+    rendered["translation_status"] = ("partial" if translation_omissions else "complete") if translated else "unavailable"
+    rendered["translation_omissions"] = translation_omissions
     return rendered

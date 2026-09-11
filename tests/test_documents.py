@@ -59,6 +59,36 @@ def minimal_text_pdf(text: str) -> bytes:
     return bytes(payload)
 
 
+def positioned_text_pdf(pages: list[list[tuple[float, float, str]]], *, font_size: float = 5) -> bytes:
+    """Generate ordinary PDF text objects, including sparse table columns."""
+
+    from pypdf import PdfWriter
+    from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+    writer = PdfWriter()
+    for lines in pages:
+        page = writer.add_blank_page(width=1200, height=900)
+        page[NameObject("/Resources")] = DictionaryObject({
+            NameObject("/Font"): DictionaryObject({
+                NameObject("/F1"): DictionaryObject({
+                    NameObject("/Type"): NameObject("/Font"),
+                    NameObject("/Subtype"): NameObject("/Type1"),
+                    NameObject("/BaseFont"): NameObject("/Courier"),
+                }),
+            }),
+        })
+        commands = []
+        for x, y, text in lines:
+            escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+            commands.append(f"BT /F1 {font_size} Tf 1 0 0 1 {x} {y} Tm ({escaped}) Tj ET")
+        stream = DecodedStreamObject()
+        stream.set_data("\n".join(commands).encode("latin-1"))
+        page[NameObject("/Contents")] = writer._add_object(stream)
+    output = io.BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
 def sun2000l_fixed_width_layout(*, repeated_rows: int = 1) -> str:
     """Representative pypdf layout text from Huawei's shared series PDF."""
 
@@ -284,6 +314,69 @@ def public_resolver(
 
 
 class PDFDocumentTests(unittest.TestCase):
+    def test_sparse_layout_does_not_consume_plain_context_or_hide_footnotes(self) -> None:
+        footer = "Footnote 7: battery operation requires 350-450 V and a temperature of 25 C."
+        lines = [(36, 860, "MODEL-42 Technical specification")]
+        for index in range(8):
+            lines.extend(((36, 820 - index * 30, f"Operating condition parameter {index}"),
+                          (1000, 820 - index * 30, "350 - 450 V")))
+        lines.append((36, 70, footer))
+        parsed = documents.parse_pdf_text(
+            positioned_text_pdf([lines]), max_pages=2, max_chars=1000,
+            timeout=10, target_models="MODEL-42",
+        )
+        self.assertFalse(parsed.truncated)
+        self.assertLessEqual(len(parsed.text), 1000)
+        self.assertIn(footer, parsed.text)
+        context = parsed.page_texts[0]
+        self.assertEqual(context["page"], 1)
+        self.assertEqual(context["parse_status"], "parsed")
+        self.assertIn(footer, context["plain_text"])
+        self.assertIn("Operating condition parameter 7  350 - 450 V", context["layout_text"])
+        self.assertFalse(context["truncated"])
+
+    def test_generated_multimodel_pdf_retains_columns_continuations_and_conditions(self) -> None:
+        first, second, _third = r5_continuation_layout_pages()
+        first = r5_fixed_width_layout() + "\n\n" + first
+        footer = "Footnote 3: -25 to +60 C; derating above +45 C; test at 230 V."
+        pages = [[(36, 860 - index * 14, line) for index, line in enumerate(text.splitlines())]
+                 for text in (first, second + "\n" + footer)]
+        content = positioned_text_pdf(pages)
+        for target, power in (("R5-8K-T2-15", "8000"), ("R5-10K-T2-15", "10000")):
+            with self.subTest(target=target):
+                parsed = documents.parse_pdf_text(content, max_pages=2, max_chars=30000,
+                                                 timeout=10, target_models=target)
+                rows = {row.source_label: row for row in parsed.parameter_rows}
+                self.assertEqual(rows["Rated AC Power [W]"].value, power)
+                self.assertEqual(rows["Grid Monitoring"].page, 2)
+                self.assertEqual(rows["Grid Monitoring"].value_state, "merged_shared")
+                self.assertIn(footer, parsed.text)
+                self.assertIn(footer, parsed.page_texts[1]["plain_text"])
+                self.assertIn("[PDF page 2/2]", parsed.text)
+
+    def test_page_snapshots_report_real_text_budget_exhaustion(self) -> None:
+        source = {"page": 1, "plain_text": "x" * 1000, "layout_text": "y" * 1000,
+                  "plain_text_truncated": False, "layout_text_truncated": False,
+                  "parse_status": "parsed"}
+        with mock.patch.object(documents, "MAX_PAGE_TEXT_SNAPSHOT_CHARS", 500):
+            context = documents._bounded_page_texts([source])[0]
+        self.assertEqual(len(context["plain_text"]) + len(context["layout_text"]), 500)
+        self.assertTrue(context["plain_text_truncated"])
+        self.assertTrue(context["layout_text_truncated"])
+        self.assertTrue(context["truncated"])
+        self.assertEqual(context["parse_status"], "partial")
+
+    def test_plain_model_identity_prioritizes_a_page_when_layout_splits_letters(self) -> None:
+        pages = [documents._PDFPageLayoutText(1, "Introduction " * 1000, (),
+                                             context_text="Introduction " * 1000),
+                 documents._PDFPageLayoutText(2, "M O D E L - 4 2 " * 1000, (),
+                                             context_text="MODEL-42\nOperating voltage 350-450 V\nFootnote: at 25 C")]
+        text, _pages, truncated = documents._assemble_pdf_page_texts(
+            pages, page_count=2, max_chars=1000, target_models=("MODEL-42",),
+        )
+        self.assertTrue(truncated)
+        self.assertIn("Operating voltage 350-450 V\nFootnote: at 25 C", text)
+
     def test_parse_pdf_returns_page_labelled_embedded_text(self) -> None:
         source = (
             "MODEL-42 Technical Datasheet Rated power 420 W "

@@ -341,6 +341,21 @@ def _is_distinctive_model_identity(value: str) -> bool:
 
 
 def _distinctive_model_fragments(value: str) -> tuple[str, ...]:
+    # Catalogue labels can put spaces around an internal model separator, e.g.
+    # ``HUAWEI SUN2000L - 3.68KTL``. Keep the complete model as one candidate;
+    # accepting either half would also accept an unrelated family or rating.
+    # Only join after a digit-bearing model fragment so a brand/description
+    # separator such as ``HUAWEI - SUN2000L`` remains outside the model.
+    value = re.sub(
+        r"([^\W_]+(?:[./_-][^\W_]+)*)\s*([./_-])\s*(?=[^\W_])",
+        lambda match: (
+            match.group(1) + match.group(2)
+            if any(character.isdecimal() for character in match.group(1))
+            else match.group(0)
+        ),
+        unicodedata.normalize("NFKC", value),
+        flags=re.UNICODE,
+    )
     fragments: list[str] = []
     seen: set[str] = set()
     for match in _MODEL_FRAGMENT_RE.finditer(value):

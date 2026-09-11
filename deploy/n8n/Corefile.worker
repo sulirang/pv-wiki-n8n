@@ -1,0 +1,9 @@
+.:53 {
+    errors
+    cache 60
+    forward . tls://1.1.1.1:853 tls://1.0.0.1:853 {
+        tls_servername cloudflare-dns.com
+        policy sequential
+        health_check 30s
+    }
+}

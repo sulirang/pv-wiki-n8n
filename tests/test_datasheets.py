@@ -53,6 +53,10 @@ def table_parse(*_args: object, target_models: list[str], **_kwargs: object) -> 
     return documents.PDFText(
         text=f"[Page 1]\n{layout}", page_count=1, extracted_pages=1, truncated=False,
         parameter_rows=rows, page_manifest=({"page": 1, "text_chars": len(layout), "has_parameters": True},),
+        page_texts=({"page": 1, "plain_text": documents._compact_page_context(layout),
+                     "layout_text": documents._compact_page_context(layout, layout=True),
+                     "plain_text_truncated": False, "layout_text_truncated": False,
+                     "truncated": False, "parse_status": "parsed"},),
     )
 
 
@@ -112,6 +116,8 @@ class DatasheetServiceTests(unittest.TestCase):
             first = self.service.read_pdf(PDF_URL, MODEL)
             self.service.read_pdf(PDF_URL, MODEL)
             self.assertEqual(parser.call_count, 1)
+            self.assertEqual(first["page_texts"][0]["page"], 1)
+            self.assertIn("Rated AC Power", first["page_texts"][0]["plain_text"])
             other = self.service.read_pdf(PDF_URL, "R5-8K-T2-15")
             self.assertEqual(parser.call_count, 2)
             self.assertEqual(first["document_id"], other["document_id"])
@@ -119,6 +125,9 @@ class DatasheetServiceTests(unittest.TestCase):
             with mock.patch.object(datasheets, "PARSER_VERSION", "test-parser-version-2"):
                 self.service.read_pdf(PDF_URL, MODEL)
             self.assertEqual(parser.call_count, 3)
+            with mock.patch.object(documents, "MAX_PAGE_TEXT_SNAPSHOT_CHARS", 500_000):
+                self.service.read_pdf(PDF_URL, MODEL)
+            self.assertEqual(parser.call_count, 4)
 
     def test_modified_parse_cache_is_recomputed_instead_of_resigned(self) -> None:
         original = self.parsed_result()
@@ -203,6 +212,9 @@ class DatasheetServiceTests(unittest.TestCase):
         self.assertIn(MODEL, result["text"])
         self.assertEqual(result["page_manifest"][0]["page"], 1)
         self.assertGreater(result["page_manifest"][0]["text_chars"], 50)
+        self.assertEqual(len(result["page_texts"]), 1)
+        self.assertIn(MODEL, result["page_texts"][0]["plain_text"])
+        self.assertFalse(result["page_texts"][0]["truncated"])
         verify_datasheet_receipt(KEY, receipt=result["receipt"], content=result["text"])
 
     def test_image_only_pdf_can_be_read_and_visually_rendered_with_receipts(self) -> None:
@@ -222,6 +234,9 @@ class DatasheetServiceTests(unittest.TestCase):
         self.assertEqual(result["text"], "")
         self.assertEqual(result["parameter_rows"], [])
         self.assertEqual(result["suggested_review_pages"], [1])
+        self.assertEqual(result["page_texts"], [{"page": 1, "plain_text": "", "layout_text": "",
+                          "plain_text_truncated": False, "layout_text_truncated": False,
+                          "truncated": False, "parse_status": "needs_visual"}])
         verify_datasheet_receipt(KEY, receipt=result["receipt"], content="")
 
         full = self.service.view_pages(result["document_id"], [1])

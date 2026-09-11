@@ -348,6 +348,44 @@ class DecisionTests(unittest.TestCase):
             ),
         )
 
+    def test_catalogue_model_keeps_spaced_separator_components_together(self) -> None:
+        for name in (
+            "HUAWEI SUN2000L - 3.68KTL",
+            "HUAWEI SUN2000L- 3.68KTL",
+            "HUAWEI SUN2000L -3.68KTL",
+            "HUAWEI - SUN2000L - 3.68KTL",
+            "HUAWEI SUN2000L\t-\t3.68KTL",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    ("SUN2000L-3.68KTL",),
+                    catalogue_model_candidates("01073873", name),
+                )
+                self.assertTrue(model_matches_catalogue_identity(
+                    "SUN2000L-3.68KTL", product_id="01073873", product_name=name,
+                ))
+                for other_model in (
+                    "SUN2000L", "3.68KTL", "SUN2000-3.68KTL",
+                    "SUN2000L1-3.68KTL", "SUN2000L-3.6KTL",
+                    "SUN2000L-3.68KTL-L1", "SUN2000L-3.68KTL-M1",
+                ):
+                    with self.subTest(other_model=other_model):
+                        self.assertFalse(model_matches_catalogue_identity(
+                            other_model, product_id="01073873", product_name=name,
+                        ))
+
+    def test_catalogue_model_retains_spaced_variant_suffix(self) -> None:
+        for suffix in ("L1", "M1"):
+            name = f"HUAWEI SUN2000L - 3.68KTL - {suffix}"
+            with self.subTest(suffix=suffix):
+                self.assertEqual(
+                    (f"SUN2000L-3.68KTL-{suffix}",),
+                    catalogue_model_candidates("01073873", name),
+                )
+                self.assertFalse(model_matches_catalogue_identity(
+                    "SUN2000L-3.68KTL", product_id="01073873", product_name=name,
+                ))
+
     def test_accepts_cited_official_publish(self) -> None:
         result = validate_decision(
             valid_decision(),

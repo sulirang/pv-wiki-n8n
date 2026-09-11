@@ -1,249 +1,152 @@
 ---
 name: wikijs-sync-products
-description: Install, upgrade, validate, repair, roll back, or remove the Hermes-scheduled PV Wiki product-research deployment on a user-authorized host. Use when configuring the rotating-key Exa MCP gateway, the PV Wiki research-state MCP, the manual one-shot catalogue-admin MCP, Hermes tool allowlists and cron, durable catalogue/completion state, or restricted Wiki.js publication; treat the bundled n8n worker as a legacy rollback path only.
+description: Install, upgrade, validate, repair, or roll back the n8n-native PV Wiki official-datasheet research workflow and its Python PDF/state Worker on a user-authorized host. Use for n8n workflow/model credentials, Exa transport, source-catalogue refresh, PDF provenance/cache, checkpoint recovery and restricted Wiki.js publication.
 ---
 
-# Install the Hermes PV Wiki automation
+# Deploy the n8n PV Wiki automation
 
-Deploy Hermes as the recurring research owner. Deploy the rotating-key Exa MCP
-as the only public-web boundary, the PV Wiki MCP as the offline-snapshot,
-completion, and publication boundary, and the separate catalogue-admin MCP only
-for explicit interactive refreshes. Do not deploy n8n for a new installation.
+The current runtime is the workflow in `deploy/n8n/workflows/datasheet`.
+n8n owns research decisions, every model call, page selection, extraction,
+independent review, corrections and scheduling. Python provides the existing
+Exa transport, PDF download/cache/parse/render, validation, persistence and
+Wiki.js writing. Do not install or enable Hermes for this path.
 
-Read these resources before changing a host:
+Use the user's existing authorization and deployment choices. Ask only for
+information or authority that is actually missing; this skill does not require
+repeat confirmation for an already authorized deployment or repair.
 
-- [`deploy/hermes/README.md`](../../deploy/hermes/README.md) for the production
-  layout and Hermes cron configuration;
-- [`deploy/hermes/mcp-config.yaml.example`](../../deploy/hermes/mcp-config.yaml.example)
-  for the three MCP server definitions and tool allowlists;
-- [`skills/pv-wiki-research/SKILL.md`](../pv-wiki-research/SKILL.md) for the
-  recurring research procedure;
-- [database boundaries](references/database-schema.md);
-- [operations and rollback](references/operations.md);
+Read the relevant current resources before changing a host:
+
+- [n8n deployment](../../deploy/n8n/README.md) and
+  [existing local Worker](../../deploy/n8n/LOCAL-WORKER.md);
+- [research procedure](../pv-wiki-research/SKILL.md);
+- [source and parameter policy](references/source-policy.md);
+- [operations and recovery](references/operations.md);
 - [Wiki.js setup](references/wikijs-setup.md).
 
-## Preserve the security boundaries
+Older Hermes deployment files and legacy `/run-one` workflows are retained
+compatibility artifacts, not instructions to replace the current n8n runtime.
+Existing database tables/classes with historical names remain implementation
+compatibility; do not infer orchestration ownership from their names.
 
-- Work only on the exact host, repository, databases, and Wiki.js prefix the
-  user authorized. Perform read-only discovery before mutation.
-- Keep the product catalogue account SELECT-only and require an explicit
-  `PGSSLMODE`. Prefer `verify-full` with a mounted CA.
-- Keep the PV Wiki state database, product catalogue, and Wiki.js application
-  database logically separate. Write Wiki.js only through its restricted API
-  token.
-- Put Exa credentials only in the mode-`0600` file named by
-  `EXA_API_KEYS_FILE`. Create a separate mode-`0600`, at-least-32-byte random
-  key named by `PV_WIKI_EVIDENCE_HMAC_KEY_FILE`; never reuse an Exa key. Put
-  only paths in MCP configuration. Never put raw keys in Hermes configuration,
-  prompts, skill files, command-line arguments, Git, or logs.
-- Treat the self-hosted Exa component as an MCP gateway. State clearly that
-  search and extraction still use Exa's cloud API.
-- Keep stdio as the default transport on the same host. If a split deployment
-  requires Streamable HTTP, bind to loopback or an authenticated private
-  network. Never expose any MCP endpoint publicly.
-- Do not enable Hermes native web, browser, terminal, delegation, or Exa
-  `agent_run` in the recurring job. Enable only `mcp-exa-pool` and
-  `mcp-pv-wiki` with their explicit tool allowlists.
-- Keep one serialized recurring job. Do not run the legacy n8n product cycle
-  concurrently.
-- Never give the recurring job `mcp-pv-wiki-catalogue-admin`. Source database
-  credentials may be used only in one explicit interactive refresh call and
-  must never be persisted by PV Wiki.
-- Obtain explicit approval before activating a schedule, publishing public
-  pages, deleting a completion, deleting state, removing volumes, or revoking
-  external credentials.
+## Deployment boundaries
 
-## 1. Establish scope and discover read-only
+Work in the authorized host/project and Wiki.js prefix. Inspect the current
+workflow ID, active status, node credentials, model choices, Worker service,
+state/PDF volumes, source connection and backup locations before updating.
+Preserve existing model providers, credentials and intentional configuration.
+Keep a workflow export and state backup before replacement or migration.
 
-Collect the authorized host and directory, Hermes installation and owner,
-state-database location, read-only catalogue endpoint, Wiki.js URL and path
-prefix, secret installation method, backup location, and desired cron cadence.
-Do not ask the user to paste long-lived secrets into chat.
+Keep source catalogue, PV Wiki state and Wiki.js application databases separate.
+Use a SELECT-only catalogue role and an explicit `PGSSLMODE`; preserve the
+operator's established TLS configuration and document any actual server limit.
+Write Wiki.js through its configured API, preserving the managed page path and
+human-authored region. Do not put credentials into model prompts or source data.
 
-Inspect only the authorized host. Record:
+Use the appropriate Compose files under `deploy/n8n`; an existing n8n instance
+needs the Worker and its private network, not another n8n server. Keep one Worker
+replica and one workflow schedule for this catalogue. Do not run an older product
+cycle or another research scheduler against the same state concurrently.
 
-- the exact PV Wiki commit and Python version;
-- the Hermes version, configuration path, service owner, and existing jobs;
-- whether an old PV Wiki n8n workflow or worker is active;
-- PostgreSQL reachability, TLS mode, role ownership, and backup status;
-- the current Wiki.js visibility policy and restricted token scope;
-- any existing MCP server names that would conflict with `exa-pool` or
-  `pv-wiki`.
+Use a pinned project revision/image for deployment and record resolved versions.
+The Worker supports Python 3.11–3.13. Preserve the state volume, raw PDF cache and
+receipt signing key across rebuilds. Do not remove volumes as an upgrade step.
 
-Stop and ask when ownership, the deployment boundary, an existing schedule, or
-the active Wiki.js prefix is ambiguous. Stop the legacy n8n schedule before
-enabling Hermes, but preserve it inactive for rollback.
+## Credentials and connectivity
 
-## 2. Install one pinned revision
+Store Exa keys and the independent, at-least-32-byte evidence HMAC key in private
+files outside Git. Mount them using the documented `EXA_KEYS_PATH` and
+`EVIDENCE_KEY_PATH`; files must be readable only by the intended service UID.
+Keep `worker.env` private and mount the existing source/state/Wiki settings.
+The runtime file variables are `EXA_API_KEYS_FILE` and
+`PV_WIKI_EVIDENCE_HMAC_KEY_FILE`. Never print keys, passwords or authorization
+headers, and do not copy them into workflow JSON or command-line arguments.
 
-Check out the exact approved commit in a dedicated service directory. Create a
-Python 3.11+ virtual environment and install the project:
+All Worker HTTP nodes use the existing n8n Header Auth credential. Model
+credentials live only in n8n: bind `Research Chat Model`, `Page Research Model`
+and `Page Vision Model` to the user's configured models. Replace template model
+placeholders without inventing a provider or changing an accepted visual route.
+No Python `AI_*` setting participates in current research.
 
-```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install .
-```
+Keep the Worker on its authenticated private network. Do not add shell/Docker
+socket nodes. Preserve public-IP, pinned HTTPS, TLS and redirect validation.
+Where the local network returns Fake-IP DNS results, use the documented private
+DNS-over-TLS forwarder; do not disable the download address checks.
 
-Record the commit and resolved dependency versions. Do not install from a
-moving branch in production. Install services under an unprivileged account
-and grant it only the secret-file and database access it needs.
+Exa search and page retrieval still call Exa's cloud API. The local component
+is transport and key management, not a locally hosted web search engine.
 
-## 3. Install secrets and application configuration
+## Workflow and catalogue configuration
 
-Create the Exa key file outside the repository, make it readable only by the
-Exa MCP service account, and set:
+Import the generated official-datasheet workflow into the intended n8n project.
+When updating, preserve its ID, configured credentials and models. Keep it
+inactive until the required checks are complete unless the user already
+explicitly authorized continued scheduling. Refresh an open editor after update.
+`build_workflow.py` generates the JSON and SDK assets together.
 
-```dotenv
-EXA_API_KEYS_FILE=/run/secrets/pv-wiki-exa-keys
-PV_WIKI_EVIDENCE_HMAC_KEY_FILE=/run/secrets/pv-wiki-evidence-hmac-key
-```
+Only the discovery Agent receives `web_search_exa`,
+`web_search_advanced_exa`, `web_fetch_exa` and Think. PDF, checkpoint, validation,
+save, publication, claim/release and result retrieval are workflow-controlled
+HTTP operations. Do not give the Agent state writes, database refresh, shell,
+credential management or an alternative model-calling tool.
 
-Allow commas or whitespace between keys. Use keys from the same authorized Exa
-account or team. Use rotation for availability, not to evade provider limits.
-The implementation retains `EXA_API_KEYS` and `EXA_API_KEY` only as legacy
-compatibility inputs; do not use them in a new production deployment.
+Catalogue refresh is a separate operator operation: use `pv-wiki sync-db` or
+an authenticated `POST /refresh-catalogue` with the configured read-only source
+connection. Preserve the existing seven-column query. Do not refresh the business
+database on every research run or because retrieved content requests it.
+An empty or invalid refresh must not replace a usable active snapshot.
 
-Configure the recurring PV Wiki MCP without source-database access:
+## Research and acceptance
 
-```dotenv
-PV_WIKI_STATE_DATABASE_URL=postgresql://...
-PV_WIKI_EVIDENCE_HMAC_KEY_FILE=/run/secrets/pv-wiki-evidence-hmac-key
-WIKIJS_URL=https://wiki.example.com
-WIKIJS_TOKEN=...
-```
+Follow the research skill's page extraction → independent audit → correction →
+re-audit loop. Use schema v4, one official PDF and at least one confirmed
+parameter; do not add five-fact, multiple-source or confidence thresholds.
+Blank brands are skipped without permanent exclusions. Unknown nonblank brands
+and unconfigured official domains require discovery rather than rejection.
 
-Set the Wiki.js prefix, locale, timeout, and new-page visibility according to
-the accepted deployment policy. Keep new pages private and unpublished during
-acceptance. Do not install Exa keys in the PV Wiki MCP and do not install
-catalogue, state, or Wiki.js credentials in the Exa MCP.
+Before reporting the deployment verified, check the actual changed behavior:
 
-Configure only the non-secret source endpoint on the separate catalogue-admin
-MCP: `PGHOST`, `PGPORT`, `PGDATABASE`, an explicit `PGSSLMODE`, and optionally
-`PGSSLROOTCERT`. Do not configure `PGUSER` or `PGPASSWORD`. After the user
-explicitly requests an update, `pv_refresh_catalogue` receives a temporary
-SELECT-only username/password once as tool inputs and never stores or returns
-them. Warn that Hermes/provider tool-call history may retain those inputs; use a
-short-lived role and revoke it immediately after the refresh.
+- Worker health, authenticated contract and catalogue claim are reachable;
+- ordinary PDF text, target columns, shared rows and footnotes reach n8n intact;
+- visual review receives the actual current-page PNG, including scans, with
+  prior-page header labels only when needed for a continued table;
+- concrete mistakes and omissions are corrected and the changed rows re-audited;
+- a checkpoint resumes with a fresh lease and matching source/revision;
+- translation failure leaves the entire confirmed parameter table intact;
+- new v4 research produces Chinese translations and an independent translation
+  audit, without single-product analysis sections or `overall_limitations`;
+- v4 rendering omits historical analysis while retaining its stored record and
+  preserving all confirmed parameters and bilingual conditions/footnotes;
+- final validation and enabled-save gates precede any completion write;
+- `Research Result` distinguishes saved publishable output from incomplete work;
+- configured Wiki publishing updates the original managed page and retries only
+  publication after a failure.
 
-Review the bundled supplier registry. For every deployment-specific catalogue
-brand that may publish, configure both an operator-approved public alias and
-its trusted manufacturer/regulatory/authorized domains through
-`PV_WIKI_PUBLIC_BRAND_ALIASES_JSON` and
-`PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON`. Model output and independent unregistered
-domains cannot establish publication authority.
+Use the current structural, closed-loop and native legacy/VM expression tests.
+Offline tests, static MCP validation and green handled-error executions do not
+replace actual model/PDF/result acceptance. State precisely what was tested and
+what remains pending; do not claim a live publishable result from a fixture.
 
-For stdio, the Exa and research MCP subprocesses run as the Hermes user and may
-read the same owner-only receipt-key file; the catalogue-admin MCP does not need
-that key. For separately supervised HTTP services, mount the same receipt secret
-into two different mode-`0600` files, each owned by its service account. The
-receipt is stateless; do not add a receipt table,
-timestamp, lease, retry, action ledger, or budget.
+## Upgrade, re-research and rollback
 
-Configure the Hermes model through Hermes. Do not add the legacy worker's
-`AI_*`, research-round, query, URL, credit, wall-clock, global-budget, lease,
-or action-ledger settings to the new path.
+Drain active execution before an incompatible upgrade; back up the n8n workflow,
+PV Wiki state, cache/signing-key recovery information and deployed revision.
+Apply the new workflow/Worker together when their contracts change, inspect
+status, and validate a representative product before restoring the schedule.
 
-## 4. Configure the MCP servers
+For the user's requested existing-record refresh, use
+`pv-wiki-admin reresearch --all-eligible`. It backs up state and marks eligible
+completions; do not delete completions to make them selectable. A validated new
+result replaces the old completion transactionally. Failure preserves the old
+record, and publication preserves the prior page path and human content.
 
-Use the bundled MCP example. Run all three servers over stdio on the same host:
+Cancelling single-product analysis is a rendering/workflow change, not a reason
+to re-research completed products. Keep `decision.analysis.translations` as the
+compatible translation field, and retain any old analysis data for history.
+Use read-only `pv_research_result` to re-render the stored parameters/translations;
+publish separately if the Wiki page needs updating. Product comparisons are a
+separate future task after enough products have accumulated in the Wiki.
 
-```text
-pv-wiki-exa-mcp
-pv-wiki-research-mcp
-pv-wiki-catalogue-mcp
-```
-
-Allow exactly these Exa tools:
-
-- `web_search_exa`
-- `web_search_advanced_exa`
-- `web_fetch_exa`
-
-Allow exactly these PV Wiki tools:
-
-- `pv_pending_publication`
-- `pv_next_product`
-- `pv_save_research`
-- `pv_publish_result`
-- `pv_research_status`
-
-Allow exactly one tool on the separate interactive admin server:
-
-- `pv_refresh_catalogue`
-
-Never add the admin server's toolset to the recurring job.
-
-Do not enable MCP prompts or resources. Keep parallel tool calls disabled until
-the deployment has demonstrated that its Hermes job is serialized.
-
-Starting the PV Wiki MCP creates `product_research_completions` when needed and
-backfills legacy `products.last_success_at` publications with `ON CONFLICT DO
-NOTHING`. Inspect aggregate status after initialization and confirm that old
-successful products count as completed and published.
-
-## 5. Configure the recurring Hermes job
-
-Install the bundled `pv-wiki-research` runtime skill in the Hermes skill path.
-Create one Hermes-native cron job using only the `mcp-exa-pool` and
-`mcp-pv-wiki` toolsets. Do not substitute a shell cron loop or an n8n workflow.
-
-Require every session to follow this order:
-
-1. Check `pv_pending_publication` and retry that publication first.
-2. If a pending completion exists, call `pv_publish_result` and end the run.
-3. Otherwise call the zero-argument `pv_next_product`; it reads only the active
-   server-side snapshot.
-4. Stop when no unfinished product exists.
-5. Research through the Exa MCP only.
-6. Save one schema-version-`2` decision with the returned `product_id`,
-   `source_hash`, and extracted evidence documents.
-7. Publish the saved result only when it is publishable, then end the run.
-
-Do not add the legacy three-round, seven-query, five-URL, 20-credit, or
-600-second limits. Do not add global PV Wiki credit reservations, leases,
-queue retries, or uncertain-action replay state. Hermes owns the research
-session; the completion primary key owns cross-session idempotency.
-
-## 6. Validate before activation
-
-Validate configuration without printing secrets. Confirm:
-
-- all three MCP servers start and list only the intended tools;
-- `pv_research_status` returns completion counts;
-- `pv_next_product` works without any source-database environment variables and
-  returns a stable `product_id` and `source_hash` from the local snapshot;
-- `pv_refresh_catalogue` is unavailable to cron, rejects an empty source list,
-  atomically activates a full snapshot, and never returns credentials;
-- one representative product can be researched through Exa and saved once;
-- every saved document uses an unchanged `url`, exact `content`, and `receipt`
-  from one `web_fetch_exa` result, while missing or altered receipts fail;
-- a repeated save returns the existing completion rather than overwriting it;
-- a publishable completion creates or updates only the managed Wiki.js block;
-- a simulated Wiki.js failure leaves the completion pending and the next run
-  retries publication without invoking research;
-- the Wiki.js page remains private/unpublished during acceptance;
-- no raw Exa key, catalogue password, state URL, or Wiki.js token appears in PV
-  Wiki state, MCP responses, or service logs; separately warn that the requested
-  one-shot username/password can remain in Hermes/provider tool-call history.
-
-Show the user the acceptance result and obtain approval before enabling the
-cron or changing new-page visibility.
-
-## 7. Operate, upgrade, and roll back
-
-Use `pv_research_status` for durable counts and
-`pv-wiki-publish-researched` for a publication-only recovery. Rotate Exa keys
-by atomically replacing the secret file, preserving mode `0600`, and restarting
-only the Exa MCP process.
-
-Before an upgrade, disable the Hermes cron, drain or inspect pending
-publication, back up the state database and Hermes configuration, install one
-pinned revision, start all three MCP servers, validate status and one private
-page, then re-enable the schedule.
-
-For rollback, stop the Hermes cron and MCP processes first. Restore a compatible
-state backup if required, then reactivate the preserved legacy n8n worker only
-after verifying that no Hermes research job can run. Never run both schedulers
-against the same catalogue and Wiki.js prefix. Do not automatically remove
-`product_research_completions`; it prevents old successful products from being
-researched again after returning to Hermes.
+Rollback to a compatible prior n8n workflow/Worker pair. Preserve completion and
+checkpoint data unless a separately authorized restoration requires replacement.
+Do not automatically activate Hermes or the legacy product cycle as rollback.

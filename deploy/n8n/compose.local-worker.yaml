@@ -1,0 +1,63 @@
+# Single local Worker for an existing Docker n8n instance.
+# Run from this directory; connect n8n to N8N_EXTERNAL_NETWORK first.
+name: pv-wiki-local
+
+services:
+  pv-wiki-worker:
+    image: pv-wiki-worker:local
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    init: true
+    restart: unless-stopped
+    depends_on:
+      - pv-wiki-dns
+    dns:
+      - ${PV_WIKI_DNS_IPV4:-172.18.0.53}
+    env_file:
+      - ${PV_WIKI_WORKER_ENV_PATH:-/etc/pv-wiki/worker.env}
+    environment:
+      PV_WIKI_STATE_PATH: /var/lib/pv-wiki/state.sqlite3
+      PV_WIKI_DATASHEET_CACHE_DIR: /var/lib/pv-wiki/datasheets
+      EXA_API_KEYS_FILE: /run/secrets/pv-wiki-exa-keys
+      PV_WIKI_EVIDENCE_HMAC_KEY_FILE: /run/secrets/pv-wiki-evidence-hmac-key
+    volumes:
+      - worker_data:/var/lib/pv-wiki
+      - type: bind
+        source: ${EXA_KEYS_PATH:-/etc/pv-wiki/exa-keys}
+        target: /run/secrets/pv-wiki-exa-keys
+        read_only: true
+      - type: bind
+        source: ${EVIDENCE_KEY_PATH:-/etc/pv-wiki/evidence-hmac-key}
+        target: /run/secrets/pv-wiki-evidence-hmac-key
+        read_only: true
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - existing_n8n
+
+  # Real public DNS answers even when the host proxy uses synthetic IPs.
+  # No host port is exposed; only this Worker opts into this resolver.
+  pv-wiki-dns:
+    image: coredns/coredns@sha256:7efd3c635b03efd68c4e8398fc45f0d993d0e9ab016f72c1cefb0fd6d01aa286
+    restart: unless-stopped
+    command: ["-conf", "/etc/coredns/Corefile"]
+    volumes:
+      - ./Corefile.worker:/etc/coredns/Corefile:ro
+    networks:
+      existing_n8n:
+        ipv4_address: ${PV_WIKI_DNS_IPV4:-172.18.0.53}
+
+volumes:
+  worker_data:
+
+networks:
+  existing_n8n:
+    external: true
+    name: ${N8N_EXTERNAL_NETWORK:-pv-wiki-local}
